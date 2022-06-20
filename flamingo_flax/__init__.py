@@ -1,0 +1,1 @@
+from flamingo_flax.flamingo_flax import Flamingo
