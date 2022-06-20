@@ -1,6 +1,8 @@
-import torch
-from torch import nn, einsum
-import torch.nn.functional as F
+import flax.linen as nn
+
+import jax
+import jax.numpy as jnp
+from jax.numpy import einsum
 
 from einops import rearrange, repeat
 from einops_exts import rearrange_many, repeat_many
@@ -40,31 +42,31 @@ class PerceiverAttention(nn.Module):
         n - sequence
         d - dimension
         """
-        x = nn.LayerNorm(dim)(x)
-        latents = nn.LayerNorm(dim)(latents)
+        x = nn.LayerNorm(epsilon = 1e-5)(x)
+        latents = nn.LayerNorm(epsilon = 1e-5)(latents)
 
         b, m, h = *x.shape[:2], self.heads
 
-        q = nn.Linear(dim, inner_dim, bias = False)(latents)
+        q = nn.Dense(features = self.inner_dim, use_bias = False)(latents)
 
         # the paper differs from Perceiver in which they also concat the key / values derived from the latents to be attended to
-        kv_input = jnp.concatenate((x, latents), dim = -2)
-        k, v = nn.Linear(dim, inner_dim * 2, bias = False)(kv_input).split(2, axis = -1)
+        kv_input = jnp.concatenate((x, latents), axis = -2)
+        k, v = nn.Dense(features = inner_dim * 2, use_bias = False)(kv_input).split(2, axis = -1)
 
         q, k, v = rearrange_many((q, k, v), 'b t n (h d) -> b h t n d', h = h)
 
-        q = q * self.scale
+        q = q * scale
 
         # attention
 
         sim = einsum('... i d, ... j d  -> ... i j', q, k)
 
-        sim = sim - sim.amax(dim = -1, keepdim = True).detach()
-        attn = sim.softmax(dim = -1)
+        sim = sim - jnp.amax(sim, axis = -1, keepdims = True).detach()
+        attn = nn.softmax(sim, axis = -1)
 
         out = einsum('... i j, ... j d -> ... i d', attn, v)
         out = rearrange(out, 'b h t n d -> b t n (h d)', h = h)
-        return nn.Linear(dim, bias = False)(out)
+        return nn.Dense(features = self.dim, use_bias = False)(out)
 
 class PerceiverResampler(nn.Module):
     dim: int
@@ -84,8 +86,8 @@ class PerceiverResampler(nn.Module):
         layers = []
         for _ in range(self.depth):
             layers.append(nn.ModuleList([
-                PerceiverAttention(dim = dim, dim_head = dim_head, heads = heads),
-                FeedForward(dim = dim, mult = ff_mult)
+                PerceiverAttention(dim = self.dim, dim_head = self.dim_head, heads = self.heads),
+                FeedForward(dim = self.dim, mult = self.ff_mult)
             ]))
 
         if x.ndim == 3:
@@ -100,7 +102,7 @@ class PerceiverResampler(nn.Module):
             latents = attn(x, latents) + latents
             latents = ff(latents) + latents
 
-        return nn.LayerNorm(dim)(latents)
+        return nn.LayerNorm(epsilon = 1e-5)(latents)
 
 # gated cross attention
 
@@ -113,42 +115,42 @@ class MaskedCrossAttention(nn.Module):
     @nn.compact
     def __call__(self, x, media, media_locations = None):
 
-        self.scale = dim_head ** -0.5
-        self.heads = heads
-        inner_dim = dim_head * heads
+        scale = self.dim_head ** -0.5
+        heads = self.heads
+        inner_dim = self.dim_head * heads
 
         # whether for text to only attend to immediate preceding image, or all images
 
-        self.only_attend_immediate_media = only_attend_immediate_media
+        only_attend_immediate_media = self.only_attend_immediate_media
 
         b, t, m = media.shape[:3]
         h = self.heads
 
-        x = nn.LayerNorm(dim)(x)
+        x = nn.LayerNorm(epsilon = 1e-5)(x)
 
-        q = nn.Linear(inner_dim, bias = False)(x)
+        q = nn.Dense(features = inner_dim, use_bias = False)(x)
         media = rearrange(media, 'b t n d -> b (t n) d')
 
-        k, v = nn.Linear(inner_dim * 2, bias = False)(media).chunk(2, dim = -1)
+        k, v = nn.Dense(features = inner_dim * 2, use_bias = False)(media).split(2, axis = -1)
         q, k, v = rearrange_many((q, k, v), 'b n (h d) -> b h n d', h = h)
 
-        q = q * self.scale
+        q = q * scale
 
         sim = einsum('... i d, ... j d -> ... i j', q, k)
 
         if exists(media_locations):
             text_time = media_locations.cumsum(dim = -1) # at each boolean of True, increment the time counter (relative to media time)
-            media_time = torch.arange(t, device = x.device) + 1
+            media_time = jnp.arange(t) + 1
 
             # text time must equal media time if only attending to most immediate image
             # otherwise, as long as text time is greater than media time (if attending to all previous images / media)
-            mask_op = torch.eq if self.only_attend_immediate_media else torch.ge
+            mask_op = jnp.eq if only_attend_immediate_media else jnp.ge
 
             text_to_media_mask = mask_op(rearrange(text_time, 'b i -> b 1 i 1'), repeat(media_time, 'j -> 1 1 1 (j m)', m = m))
-            sim = sim.masked_fill(~text_to_media_mask, -torch.finfo(sim.dtype).max)
+            sim = sim.masked_fill(~text_to_media_mask, -jnp.finfo(sim.dtype).max)
 
-        sim = sim - sim.amax(dim = -1, keepdim = True).detach()
-        attn = sim.softmax(dim = -1)
+        sim = sim - jnp.amax(sim, axis = -1, keepdims = True).detach()
+        attn = nn.softmax(sim, axis = -1)
 
         if exists(media_locations) and self.only_attend_immediate_media:
             # any text without a preceding media needs to have attention zeroed out
@@ -158,7 +160,7 @@ class MaskedCrossAttention(nn.Module):
 
         out = einsum('... i j, ... j d -> ... i d', attn, v)
         out = rearrange(out, 'b h n d -> b n (h d)')
-        return nn.Linear(dim, bias = False)(out)
+        return nn.Dense(features = self.dim, use_bias = False)(out)
 
 class GatedCrossAttentionBlock(nn.Module):
     dim: int
@@ -175,12 +177,12 @@ class GatedCrossAttentionBlock(nn.Module):
         media_locations = None  # boolean tensor indicating positions of media - (batch, sequence)
     ):
 
-        self.attn = MaskedCrossAttention(dim = dim, dim_head = dim_head, heads = heads, only_attend_immediate_media = only_attend_immediate_media)
-        self.attn_gate = nn.Parameter(torch.tensor([0.]))
+        attn = MaskedCrossAttention(dim = self.dim, dim_head = self.dim_head, heads = self.heads, only_attend_immediate_media = self.only_attend_immediate_media)
+        attn_gate = nn.Parameter(torch.tensor([0.]))
 
-        self.ff = FeedForward(dim, mult = ff_mult)
-        self.ff_gate = nn.Parameter(torch.tensor([0.]))
+        ff = FeedForward(self.dim, mult = self.ff_mult)
+        ff_gate = nn.Parameter(torch.tensor([0.]))
 
-        x = self.attn(x, media, media_locations = media_locations) * self.attn_gate.tanh() + x
-        x = self.ff(x) * self.ff_gate.tanh()  + x
+        x = attn(x, media, media_locations = media_locations) * jnp.tanh(attn_gate) + x
+        x = ff(x) * jnp.tanh(ff_gate)  + x
         return x
